@@ -1,0 +1,28 @@
+experiment_name: ray-esm2-embed
+environment:
+  dependencies: dependencies.yaml
+env_variables:
+  NCCL_NET_PLUGIN: "none"
+  NUM_WORKERS: "8"
+  BATCH_SIZE: "32"
+  MAX_LENGTH: "1024"
+  ESM2_MODEL: "facebook/esm2_t33_650M_UR50D"
+  # UC Volume bridge paths — stage the input from Spark FIRST, then submit this job.
+  INPUT_STAGE_DIR:      "/Volumes/main/guanyu_chen/sgc/ray_input_stage"
+  OUTPUT_STAGE_PARQUET: "/Volumes/main/guanyu_chen/sgc/ray_output_stage_parquet"
+compute:
+  # Orchestrator runs on 1 node; the @ray_launch decorator provisions
+  # NUM_WORKERS additional A10 nodes for the Ray cluster.
+  gpus: 1
+  gpu_type: a10
+max_retries: 0
+code_source:
+  type: snapshot
+  snapshot:
+    allow_uncommitted: true
+    repo_path: <UPDATE_THIS_to_local_path_of_sgcli-inference>
+    include_paths:
+      - ray_esm2_embed
+command: |-
+  echo ">>> ESM-2 batch embedding via Ray Data on SGC"
+  python3 $CODE_SOURCE_PATH/sgcli-inference/ray_esm2_embed/embed.py

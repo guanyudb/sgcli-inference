@@ -1,0 +1,106 @@
+###############################################################################
+# Dockerfile.inference.sgc — TEDDY-G inference image for Databricks Serverless
+# GPU Compute (SGCLI / DCS).
+#
+# Differences vs Dockerfile.inference (the ECR/NGC image):
+#   - Base: databricksruntime/air:dcs-base-aws-runtime (CUDA 12.9 + NCCL + EFA
+#     preconfigured; required path for SGC multi-node compatibility).
+#   - PyTorch is NOT preinstalled in the air base — installed explicitly.
+#   - TEDDY code + 400M weights are fetched from HuggingFace
+#     (huggingface.co/Merck/TEDDY) at build time. The 70M / 160M weight
+#     directories are filtered out to keep the image small.
+#   - No sample data baked in; SGC reads inputs from workspace files / UC.
+#   - No ENTRYPOINT/CMD — SGC invokes via YAML `command:` with absolute paths.
+#   - NCCL_NET_PLUGIN=none silences EFA OFI warnings on A10 (non-EFA hardware).
+#
+# Build context: sgc_container/sgc_container/   (this directory)
+#
+# Build:
+#   docker login   # Docker Hub (private repo + PAT)
+#   # Optional: --build-arg HF_TOKEN=... if you hit HF rate limits
+#   docker build \
+#     -f Dockerfile.inference.sgc \
+#     -t <docker-hub-user>/teddy-inference:sgc-$(date +%Y%m%d) .
+#   docker push <docker-hub-user>/teddy-inference:sgc-$(date +%Y%m%d)
+#
+# Register (one-time per tag per user):
+#   sgcli register image <docker-hub-user>/teddy-inference:sgc-<tag> \
+#     --interactive-authenticate -p <profile>
+#
+# Run:
+#   sgcli run --file inference_workload.yaml -p <profile> --watch
+###############################################################################
+
+# Pin platform: SGC hosts are linux/amd64 and the air base image is only
+# published for amd64. On Apple Silicon you MUST emulate — see the buildx
+# command in scripts_sgc_inference_run.sh.
+FROM --platform=linux/amd64 databricksruntime/air:dcs-base-aws-runtime
+
+ARG TEDDY_MODEL_SIZE=400M
+ARG HF_TOKEN=""
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HYDRA_FULL_ERROR=1 \
+    TEDDY_MODEL_PATH=/workspace/teddy_repo/Merck/TEDDY \
+    TEDDY_MODEL_SIZE=${TEDDY_MODEL_SIZE} \
+    NCCL_NET_PLUGIN=none
+
+# 1. System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. PyTorch (the air base ships CUDA 12.9 but no torch). The cu124 wheel is
+#    forward-compatible on the host's 580.x driver per the DCS guide.
+#    --index-url pinned to the Databricks PyPI proxy — direct pypi.org is not
+#    reachable from this build environment.
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        --index-url https://pypi-proxy.cloud.databricks.com/simple \
+        torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+
+# 3. Python requirements — slim, pinned set just for inference. See the
+#    header comment in requirements.inference.sgc.txt for why this is a
+#    separate file from the shared requirements.txt.
+#    --prefer-binary keeps pip on wheels; if a fallback to sdist is needed
+#    (e.g. for an old pyarrow), the build will fail loudly instead of
+#    silently downloading a 5-year-old source tree.
+COPY requirements.inference.sgc.txt /tmp/requirements.inference.sgc.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        --index-url https://pypi-proxy.cloud.databricks.com/simple \
+        --prefer-binary \
+        -r /tmp/requirements.inference.sgc.txt
+
+# 4. Fetch TEDDY (code + 400M weights only) from HuggingFace.
+#    Filters out 70M/160M weight dirs to keep the image small.
+WORKDIR /workspace
+RUN HF_TOKEN="${HF_TOKEN}" python3 - <<'PYEOF'
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="Merck/TEDDY",
+    local_dir="/workspace/teddy_repo/Merck/TEDDY",
+    token=os.environ.get("HF_TOKEN") or None,
+    ignore_patterns=[
+        "teddy/models/teddy_g/70M/*",
+        "teddy/models/teddy_g/160M/*",
+    ],
+)
+print("Downloaded TEDDY (400M) to /workspace/teddy_repo/Merck/TEDDY")
+PYEOF
+
+# 5. Validate the 400M checkpoint is present
+RUN find /workspace/teddy_repo -path "*teddy_g/400M/config.json" | grep -q . && \
+    find /workspace/teddy_repo -path "*teddy_g/400M/model.safetensors" | grep -q . && \
+    echo "TEDDY-G 400M checkpoint OK"
+
+# 6. Inference entrypoint (no ENTRYPOINT — SGC YAML invokes python3 directly).
+RUN mkdir -p /workspace/app
+COPY run_inference.py /workspace/app/run_inference.py
+
+# PYTHONPATH: Merck/TEDDY dir contains the teddy/ subpackage -> `import teddy` works.
+# The air base does not set PYTHONPATH, so set it absolutely (don't try to
+# inherit — that triggers a BuildKit UndefinedVar lint).
+ENV PYTHONPATH=/workspace/teddy_repo/Merck/TEDDY:/workspace/app

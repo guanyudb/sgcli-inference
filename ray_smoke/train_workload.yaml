@@ -1,0 +1,24 @@
+experiment_name: ray-smoke-test
+environment:
+  dependencies: dependencies.yaml
+env_variables:
+  NCCL_NET_PLUGIN: "none"
+  NUM_WORKERS: "2"
+  GPU_TYPE: "a10"
+  # Update to a UC Volume path your profile can write to:
+  RAY_SMOKE_OUTPUT: "/Volumes/main/guanyu_chen/sgc/ray_smoke_output"
+compute:
+  # Orchestrator: 1 A10 to host the Ray driver / launcher
+  gpus: 1
+  gpu_type: a10
+max_retries: 0
+code_source:
+  type: snapshot
+  snapshot:
+    allow_uncommitted: true
+    repo_path: <UPDATE_THIS_to_local_path_of_sgcli-inference>
+    include_paths:
+      - ray_smoke
+command: |-
+  echo ">>> Ray smoke test"
+  python3 $CODE_SOURCE_PATH/sgcli-inference/ray_smoke/ray_smoke.py

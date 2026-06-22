@@ -1,0 +1,50 @@
+experiment_name: sgc-docker-test
+environment:
+  docker_image:
+    url: srijitnair254/teddy-inference:sgc-ngc-20260603
+env_variables:
+  NCCL_NET_PLUGIN: "none"
+compute:
+  gpus: 8
+  gpu_type: A10
+max_retries: 0
+command: |-
+  set -e
+  echo ">>> SGC docker test using Srijit's teddy-inference image"
+
+  # --- GPU sanity check
+  python3 -c "
+  import torch
+  print(f'torch:           {torch.__version__}')
+  print(f'CUDA available:  {torch.cuda.is_available()}')
+  print(f'CUDA version:    {torch.version.cuda}')
+  print(f'Device count:    {torch.cuda.device_count()}')
+  print(f'Device name:     {torch.cuda.get_device_name(0)}')
+  a = torch.randn(1000, 1000, device='cuda')
+  print(f'Matmul sum:      {(a @ a.T).sum().item():.2f}')
+  print('CUDA sanity check passed.')
+  "
+
+  # --- Discover image layout (one-time, helpful for debugging)
+  echo ">>> Image layout discovery"
+  echo "--- ls /app ---";       ls -la /app       2>/dev/null || echo "(no /app)"
+  echo "--- ls /workspace ---"; ls -la /workspace 2>/dev/null || echo "(no /workspace)"
+  echo "--- find run_inference.py ---"
+  RUN_SCRIPT=$(find /app /workspace -name "run_inference.py" 2>/dev/null | head -1)
+  echo "Found: ${RUN_SCRIPT:-NOT FOUND}"
+
+  if [ -z "$RUN_SCRIPT" ]; then
+    echo "ERROR: run_inference.py not found inside the image"
+    exit 1
+  fi
+
+  # --- Run inference with paths from Srijit's image
+  echo ">>> Running inference"
+  python3 "$RUN_SCRIPT" \
+    --input /workspace/teddy_repo/Merck/TEDDY/data/sample_data.h5ad \
+    --teddy-path /workspace/teddy_repo/Merck/TEDDY \
+    --output /workspace/outputs/embeddings \
+    --device cuda \
+    --model-size 400M \
+    --max-cells 100 \
+    --skip-umap
