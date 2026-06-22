@@ -37,10 +37,7 @@ import os
 import sys
 from pathlib import Path
 
-from serverless_gpu.ray import ray_launch
-
-
-NUM_WORKERS  = int(os.environ.get("NUM_WORKERS",  "8"))
+NUM_WORKERS  = int(os.environ.get("NUM_WORKERS",  "1"))
 BATCH_SIZE   = int(os.environ.get("BATCH_SIZE",   "32"))
 MAX_LENGTH   = int(os.environ.get("MAX_LENGTH",   "1024"))
 ESM2_MODEL   = os.environ.get("ESM2_MODEL", "facebook/esm2_t33_650M_UR50D")
@@ -49,27 +46,47 @@ INPUT_STAGE_DIR      = os.environ["INPUT_STAGE_DIR"]
 OUTPUT_STAGE_PARQUET = os.environ["OUTPUT_STAGE_PARQUET"]
 
 
-@ray_launch(gpus=NUM_WORKERS, gpu_type="a10", remote=True)
 def embed_with_ray():
-    """Runs on rank-0 as the Ray driver after Ray head + workers are up."""
+    """Run Ray Data ESM-2 embedding on the local pod.
+
+    Note: We do NOT use @ray_launch / .distributed() here.
+    `serverless_gpu.launcher.distributed()` calls
+    set_databricks_credentials_from_dbutils() which only works in a notebook
+    context (requires cluster_id from the dbutils context). When launched
+    via `sgcli run`, dbutils has no cluster_id, so the call fails with
+    `cluster_id is required in the configuration`.
+
+    For single-node (and single-pod) sgcli runs, we just init Ray locally
+    and use Ray Data normally — same map_batches/write_parquet pipeline,
+    no remote pod provisioning needed. For multi-node Ray, run the original
+    notebook (03_batch_embed_sequences_ray.py) from a Databricks notebook
+    attached to SGC compute.
+    """
+    import time
     import numpy as np
     import ray
     import torch
     from transformers import AutoTokenizer, AutoModel
 
-    print(f"Ray cluster resources: {ray.cluster_resources()}")
+    # Local Ray init (single pod). num_gpus=1 so the GPU is visible to actors.
+    if not ray.is_initialized():
+        ray.init(num_gpus=torch.cuda.device_count(), ignore_reinit_error=True)
+    print(f"[ray-driver] Ray cluster resources: {ray.cluster_resources()}")
+    print(f"[ray-driver] Ray cluster nodes:     {len(ray.nodes())}")
 
     class ESM2Embedder:
         """Stateful Ray Data actor — loads ESM-2 once per actor (per GPU)."""
 
         def __init__(self):
+            t0 = time.time()
             self.tokenizer = AutoTokenizer.from_pretrained(ESM2_MODEL)
             self.model = (
                 AutoModel.from_pretrained(ESM2_MODEL, torch_dtype=torch.float16)
                 .cuda()
                 .eval()
             )
-            print(f"ESM-2 (FP16) loaded on {torch.cuda.get_device_name(0)}")
+            print(f"[actor] ESM-2 (FP16) loaded on {torch.cuda.get_device_name(0)} "
+                  f"in {time.time()-t0:.1f}s")
 
         def __call__(self, batch):
             seqs = list(batch["sequence"])
@@ -93,8 +110,10 @@ def embed_with_ray():
             }
 
     ds = ray.data.read_parquet(INPUT_STAGE_DIR)
-    print(f"Dataset rows: {ds.count()}")
+    n_rows = ds.count()
+    print(f"[ray-driver] Input rows: {n_rows}")
 
+    t_embed_start = time.time()
     result = ds.map_batches(
         ESM2Embedder,
         batch_size=BATCH_SIZE,
@@ -102,10 +121,18 @@ def embed_with_ray():
         concurrency=NUM_WORKERS,
         batch_format="numpy",
     )
-
-    print(f"Distributed write_parquet to {OUTPUT_STAGE_PARQUET}")
+    print(f"[ray-driver] Writing parquet to {OUTPUT_STAGE_PARQUET}")
     result.write_parquet(OUTPUT_STAGE_PARQUET)
-    print("Ray write_parquet complete")
+    elapsed = time.time() - t_embed_start
+
+    throughput = n_rows / elapsed if elapsed > 0 else 0.0
+    print(f"\n[ray-driver] ===== TIMING =====")
+    print(f"[ray-driver] workers (NUM_WORKERS): {NUM_WORKERS}")
+    print(f"[ray-driver] rows processed:       {n_rows}")
+    print(f"[ray-driver] embed+write wall:     {elapsed:.2f}s")
+    print(f"[ray-driver] throughput:           {throughput:.1f} seq/s")
+    print(f"[ray-driver] per-worker throughput: {throughput/NUM_WORKERS:.1f} seq/s/worker")
+    print(f"[ray-driver] ==================")
 
 
 def main():
@@ -133,8 +160,12 @@ def main():
         print("ERROR: input stage is empty")
         sys.exit(2)
 
-    embed_with_ray.distributed()
-    print("\nRay job complete.")
+    import time
+    t_total = time.time()
+    embed_with_ray()
+    t_total_elapsed = time.time() - t_total
+    print(f"\n[orchestrator] embed_with_ray() wall: {t_total_elapsed:.2f}s")
+    print("[orchestrator] Ray job complete.")
 
     # Post-flight: verify output is non-empty
     if not Path(OUTPUT_STAGE_PARQUET).exists():
