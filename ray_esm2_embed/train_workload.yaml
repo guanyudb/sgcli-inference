@@ -26,4 +26,4 @@ code_source:
       - ray_esm2_embed
 command: |-
   echo ">>> ESM-2 batch embedding via Ray Data on SGC"
-  python3 $CODE_SOURCE_PATH/sgcli-inference/ray_esm2_embed/embed.py
+  python3 $CODE_SOURCE_PATH/ray_esm2_embed/embed.py

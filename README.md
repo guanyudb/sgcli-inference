@@ -53,19 +53,34 @@ python ray_esm2_embed/prep_data.py \
 sgcli run -f ray_esm2_embed/train_workload.yaml -p <PROFILE> --watch
 ```
 
-Verified baseline (1 A10, e2FE workspace, 1000 sequences):
+## Benchmark sweep (10K UniRef50 sequences, e2FE)
+
+Run the three preset benchmarks back-to-back to validate scaling:
+
+```bash
+# Stage 10K seqs once
+python ray_esm2_embed/prep_data.py \
+  --output /Volumes/<cat>/<schema>/sgc/ray_input_stage_10k \
+  --n 10000 --profile <PROFILE>
+
+# Then submit each in turn
+sgcli run -f ray_esm2_embed/bench_1a10.yaml  -p <PROFILE> --watch
+sgcli run -f ray_esm2_embed/bench_2a10.yaml  -p <PROFILE> --watch
+sgcli run -f ray_esm2_embed/bench_1h100.yaml -p <PROFILE> --watch
 ```
-[ray-driver] ===== TIMING =====
-[ray-driver] workers (NUM_WORKERS): 1
-[ray-driver] rows processed:       1000
-[ray-driver] embed+write wall:     74.7s
-[ray-driver] throughput:           13.4 seq/s
-[ray-driver] per-worker throughput: 13.4 seq/s/worker
-[ray-driver] ==================
-[orchestrator] embed_with_ray() wall: 104.2s
-Output row count: 1000
-[INFO] Job status: SUCCESS
-```
+
+Measured results on e2FE:
+
+| Config | Layout | Embed wall | Aggregate tput | Per-GPU tput | vs 1-A10 |
+|--------|--------|-----------|----------------|--------------|----------|
+| 1× A10 | 1 node × 1 GPU | 511 s | 19.6 seq/s | 19.6 | 1.00x |
+| 2× A10 (sharded) | 2 nodes × 1 GPU | 270 s | 37.1 seq/s | 18.6 | 1.89x |
+| 1 H100 node | 1 node × 8 GPU | 38.7 s | **258.2 seq/s** | 32.3 | **13.2x** |
+
+Notes:
+- 2× A10 scaling is ~95% efficient (1.89x of 2.0x ideal)
+- H100 per-GPU is ~1.65x A10 (less than typical 3-4x for transformers — ESM-2 650M with bs=32, seq_len=1024 in FP16 is memory-bandwidth bound, not compute bound)
+- Earlier 1 A10 / 1K seq result was 13.4 seq/s — lower because per-batch overhead wasn't amortized
 
 ## Known platform gotchas (the ones we hit)
 

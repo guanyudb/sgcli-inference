@@ -1,17 +1,18 @@
-experiment_name: ray-esm2-embed-e2fe
+experiment_name: esm2-bench-1h100
 environment:
   dependencies: dependencies.yaml
   env_variables:
     NCCL_NET_PLUGIN: "none"
-    NUM_WORKERS: "1"
+    # H100 = 8 GPU per node. Single pod, 8 Ray actors via NUM_WORKERS.
+    NUM_WORKERS: "8"
     BATCH_SIZE: "32"
     MAX_LENGTH: "1024"
     ESM2_MODEL: "facebook/esm2_t33_650M_UR50D"
-    INPUT_STAGE_DIR:      "/Volumes/users/guanyu_chen/sgc/ray_input_stage"
-    OUTPUT_STAGE_PARQUET: "/Volumes/users/guanyu_chen/sgc/ray_output_stage_parquet_w1"
+    INPUT_STAGE_DIR:      "/Volumes/<cat>/<schema>/sgc/ray_input_stage_10k"
+    OUTPUT_STAGE_PARQUET: "/Volumes/<cat>/<schema>/sgc/ray_output_10k_1h100"
 compute:
-  gpus: 1
-  gpu_type: a10
+  gpus: 8
+  gpu_type: h100
 max_retries: 0
 code_source:
   type: snapshot
@@ -21,5 +22,5 @@ code_source:
     include_paths:
       - ray_esm2_embed
 command: |-
-  echo ">>> ESM-2 batch embedding via Ray Data on SGC (e2FE)"
+  echo ">>> Benchmark: 1 H100 node (8 GPU), 10K seqs"
   python3 $CODE_SOURCE_PATH/ray_esm2_embed/embed.py

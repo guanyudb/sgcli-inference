@@ -1,4 +1,4 @@
-experiment_name: ray-esm2-embed-e2fe
+experiment_name: esm2-bench-1a10
 environment:
   dependencies: dependencies.yaml
   env_variables:
@@ -7,8 +7,8 @@ environment:
     BATCH_SIZE: "32"
     MAX_LENGTH: "1024"
     ESM2_MODEL: "facebook/esm2_t33_650M_UR50D"
-    INPUT_STAGE_DIR:      "/Volumes/users/guanyu_chen/sgc/ray_input_stage"
-    OUTPUT_STAGE_PARQUET: "/Volumes/users/guanyu_chen/sgc/ray_output_stage_parquet_w1"
+    INPUT_STAGE_DIR:      "/Volumes/<cat>/<schema>/sgc/ray_input_stage_10k"
+    OUTPUT_STAGE_PARQUET: "/Volumes/<cat>/<schema>/sgc/ray_output_10k_1a10"
 compute:
   gpus: 1
   gpu_type: a10
@@ -21,5 +21,5 @@ code_source:
     include_paths:
       - ray_esm2_embed
 command: |-
-  echo ">>> ESM-2 batch embedding via Ray Data on SGC (e2FE)"
+  echo ">>> Benchmark: 1 A10, 10K seqs"
   python3 $CODE_SOURCE_PATH/ray_esm2_embed/embed.py

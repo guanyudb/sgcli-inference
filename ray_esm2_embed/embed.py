@@ -109,9 +109,35 @@ def embed_with_ray():
                 "embedding": embs.tolist(),
             }
 
+    # SGC launches `compute.gpus` processes total. For A10 (1 GPU/node)
+    # they're all on separate nodes; for H100 (8 GPUs/node), all 8 procs
+    # live on the same node and Ray sees all 8 GPUs locally.
+    #
+    # We want ONE Ray driver per NODE (not per process), letting Ray spawn
+    # `LOCAL_WORLD_SIZE` actors on that node's GPUs. Non-rank-0 local procs
+    # exit early to avoid starting competing Ray clusters.
+    node_rank        = int(os.environ.get("NODE_RANK", "0"))
+    local_rank       = int(os.environ.get("LOCAL_RANK", "0"))
+    num_nodes        = int(os.environ.get("NUM_NODES", "1"))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+
+    if local_rank != 0:
+        print(f"[node {node_rank} local_rank {local_rank}] not the local "
+              f"Ray driver — exiting cleanly so node leader can run unimpeded")
+        return
+
     ds = ray.data.read_parquet(INPUT_STAGE_DIR)
+    total_rows = ds.count()
+    if num_nodes > 1:
+        ds = ds.split(num_nodes, equal=True)[node_rank]
+        output_dir = f"{OUTPUT_STAGE_PARQUET}/node_{node_rank}"
+        print(f"[ray-driver] Sharded: node {node_rank}/{num_nodes}, "
+              f"writing to {output_dir}")
+    else:
+        output_dir = OUTPUT_STAGE_PARQUET
     n_rows = ds.count()
-    print(f"[ray-driver] Input rows: {n_rows}")
+    print(f"[ray-driver] Input rows (this node): {n_rows} of {total_rows} total")
+    print(f"[ray-driver] Node layout: {num_nodes} nodes × {local_world_size} GPU/node")
 
     t_embed_start = time.time()
     result = ds.map_batches(
@@ -121,16 +147,16 @@ def embed_with_ray():
         concurrency=NUM_WORKERS,
         batch_format="numpy",
     )
-    print(f"[ray-driver] Writing parquet to {OUTPUT_STAGE_PARQUET}")
-    result.write_parquet(OUTPUT_STAGE_PARQUET)
+    print(f"[ray-driver] Writing parquet to {output_dir}")
+    result.write_parquet(output_dir)
     elapsed = time.time() - t_embed_start
 
     throughput = n_rows / elapsed if elapsed > 0 else 0.0
-    print(f"\n[ray-driver] ===== TIMING =====")
+    print(f"\n[ray-driver] ===== TIMING (node {node_rank}/{num_nodes}) =====")
     print(f"[ray-driver] workers (NUM_WORKERS): {NUM_WORKERS}")
     print(f"[ray-driver] rows processed:       {n_rows}")
     print(f"[ray-driver] embed+write wall:     {elapsed:.2f}s")
-    print(f"[ray-driver] throughput:           {throughput:.1f} seq/s")
+    print(f"[ray-driver] throughput (this node): {throughput:.1f} seq/s")
     print(f"[ray-driver] per-worker throughput: {throughput/NUM_WORKERS:.1f} seq/s/worker")
     print(f"[ray-driver] ==================")
 
