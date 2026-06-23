@@ -1,0 +1,29 @@
+experiment_name: esm2-h100-sweep
+environment:
+  dependencies: dependencies.yaml
+  env_variables:
+    NCCL_NET_PLUGIN: "none"
+    NUM_WORKERS: "8"
+    BATCH_SIZE: "32"      # override per-experiment via --override
+    MAX_LENGTH: "1024"
+    ESM2_MODEL: "facebook/esm2_t33_650M_UR50D"
+    EMBED_LIMIT: "100000"
+    TORCH_COMPILE: "0"
+    RAY_TARGET_BLOCK_SIZE: "0"
+    PRETOKENIZED: "0"
+    INPUT_STAGE_DIR:      "/Volumes/<cat>/<schema>/sgc/ray_input_stage_500k"
+    OUTPUT_STAGE_PARQUET: "/Volumes/<cat>/<schema>/sgc/ray_output_h100_sweep"
+compute:
+  gpus: 8
+  gpu_type: h100
+max_retries: 0
+code_source:
+  type: snapshot
+  snapshot:
+    allow_uncommitted: true
+    repo_path: <UPDATE_THIS_to_local_path_of_sgcli-inference>
+    include_paths:
+      - ray_esm2_embed
+command: |-
+  echo ">>> H100 sweep variant"
+  python3 $CODE_SOURCE_PATH/ray_esm2_embed/embed.py

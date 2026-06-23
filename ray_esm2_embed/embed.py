@@ -42,6 +42,12 @@ BATCH_SIZE   = int(os.environ.get("BATCH_SIZE",   "32"))
 MAX_LENGTH   = int(os.environ.get("MAX_LENGTH",   "1024"))
 ESM2_MODEL   = os.environ.get("ESM2_MODEL", "facebook/esm2_t33_650M_UR50D")
 
+# Optional tuning knobs for the H100 sweep
+EMBED_LIMIT       = int(os.environ.get("EMBED_LIMIT", "0"))            # 0 = full dataset
+USE_TORCH_COMPILE = os.environ.get("TORCH_COMPILE", "0") == "1"
+RAY_TARGET_BLOCK_SIZE = int(os.environ.get("RAY_TARGET_BLOCK_SIZE", "0"))  # 0 = default
+PRETOKENIZED      = os.environ.get("PRETOKENIZED", "0") == "1"
+
 INPUT_STAGE_DIR      = os.environ["INPUT_STAGE_DIR"]
 OUTPUT_STAGE_PARQUET = os.environ["OUTPUT_STAGE_PARQUET"]
 
@@ -73,30 +79,48 @@ def embed_with_ray():
         ray.init(num_gpus=torch.cuda.device_count(), ignore_reinit_error=True)
     print(f"[ray-driver] Ray cluster resources: {ray.cluster_resources()}")
     print(f"[ray-driver] Ray cluster nodes:     {len(ray.nodes())}")
+    print(f"[ray-driver] Knobs: BATCH={BATCH_SIZE} WORKERS={NUM_WORKERS} "
+          f"COMPILE={USE_TORCH_COMPILE} BLOCK={RAY_TARGET_BLOCK_SIZE} "
+          f"LIMIT={EMBED_LIMIT}")
+
+    if RAY_TARGET_BLOCK_SIZE > 0:
+        ctx = ray.data.DataContext.get_current()
+        ctx.target_max_block_size = RAY_TARGET_BLOCK_SIZE
+        print(f"[ray-driver] Set target_max_block_size = {RAY_TARGET_BLOCK_SIZE}")
 
     class ESM2Embedder:
         """Stateful Ray Data actor — loads ESM-2 once per actor (per GPU)."""
 
         def __init__(self):
             t0 = time.time()
-            self.tokenizer = AutoTokenizer.from_pretrained(ESM2_MODEL)
+            if not PRETOKENIZED:
+                self.tokenizer = AutoTokenizer.from_pretrained(ESM2_MODEL)
             self.model = (
                 AutoModel.from_pretrained(ESM2_MODEL, torch_dtype=torch.float16)
                 .cuda()
                 .eval()
             )
+            if USE_TORCH_COMPILE:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                print(f"[actor] torch.compile enabled (mode=reduce-overhead)")
             print(f"[actor] ESM-2 (FP16) loaded on {torch.cuda.get_device_name(0)} "
-                  f"in {time.time()-t0:.1f}s")
+                  f"in {time.time()-t0:.1f}s "
+                  f"({'pre-tokenized input' if PRETOKENIZED else 'tokenize in actor'})")
 
         def __call__(self, batch):
-            seqs = list(batch["sequence"])
-            tokens = self.tokenizer(
-                seqs,
-                return_tensors="pt",
-                truncation=True,
-                max_length=MAX_LENGTH,
-                padding=True,
-            ).to("cuda")
+            if PRETOKENIZED:
+                input_ids = torch.tensor(np.stack(batch["input_ids"]), device="cuda")
+                mask_t    = torch.tensor(np.stack(batch["attention_mask"]), device="cuda")
+                tokens = {"input_ids": input_ids, "attention_mask": mask_t}
+            else:
+                seqs = list(batch["sequence"])
+                tokens = self.tokenizer(
+                    seqs,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=MAX_LENGTH,
+                    padding=True,
+                ).to("cuda")
             with torch.no_grad():
                 out = self.model(**tokens)
             # Attention-mask-weighted mean pool (matches the original notebook)
@@ -128,6 +152,10 @@ def embed_with_ray():
 
     ds = ray.data.read_parquet(INPUT_STAGE_DIR)
     total_rows = ds.count()
+    if EMBED_LIMIT > 0 and EMBED_LIMIT < total_rows:
+        ds = ds.limit(EMBED_LIMIT)
+        print(f"[ray-driver] EMBED_LIMIT={EMBED_LIMIT}: subset {EMBED_LIMIT} of {total_rows}")
+        total_rows = EMBED_LIMIT
     if num_nodes > 1:
         ds = ds.split(num_nodes, equal=True)[node_rank]
         output_dir = f"{OUTPUT_STAGE_PARQUET}/node_{node_rank}"
@@ -138,6 +166,33 @@ def embed_with_ray():
     n_rows = ds.count()
     print(f"[ray-driver] Input rows (this node): {n_rows} of {total_rows} total")
     print(f"[ray-driver] Node layout: {num_nodes} nodes × {local_world_size} GPU/node")
+
+    # Start a background GPU utilization sampler (5s interval, much finer
+    # than MLflow's default 30s) so we can characterize saturation even on
+    # short runs. Stats are aggregated at the end.
+    import threading
+    util_samples: list[list[int]] = []
+    mem_samples: list[list[int]] = []
+    sampler_stop = threading.Event()
+
+    def _gpu_sampler():
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            n_gpu = pynvml.nvmlDeviceGetCount()
+            handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(n_gpu)]
+            while not sampler_stop.wait(5.0):
+                util_samples.append([pynvml.nvmlDeviceGetUtilizationRates(h).gpu for h in handles])
+                mem_samples.append([
+                    int(100 * pynvml.nvmlDeviceGetMemoryInfo(h).used /
+                        pynvml.nvmlDeviceGetMemoryInfo(h).total)
+                    for h in handles
+                ])
+        except Exception as e:
+            print(f"[sampler] disabled: {e}")
+
+    sampler = threading.Thread(target=_gpu_sampler, daemon=True)
+    sampler.start()
 
     t_embed_start = time.time()
     result = ds.map_batches(
@@ -150,6 +205,8 @@ def embed_with_ray():
     print(f"[ray-driver] Writing parquet to {output_dir}")
     result.write_parquet(output_dir)
     elapsed = time.time() - t_embed_start
+    sampler_stop.set()
+    sampler.join(timeout=2.0)
 
     throughput = n_rows / elapsed if elapsed > 0 else 0.0
     print(f"\n[ray-driver] ===== TIMING (node {node_rank}/{num_nodes}) =====")
@@ -159,6 +216,22 @@ def embed_with_ray():
     print(f"[ray-driver] throughput (this node): {throughput:.1f} seq/s")
     print(f"[ray-driver] per-worker throughput: {throughput/NUM_WORKERS:.1f} seq/s/worker")
     print(f"[ray-driver] ==================")
+
+    if util_samples:
+        n_gpu = len(util_samples[0])
+        n_samples = len(util_samples)
+        print(f"\n[ray-driver] ===== GPU UTILIZATION ({n_samples} samples @ 5s) =====")
+        for g in range(n_gpu):
+            utils = [s[g] for s in util_samples]
+            mems  = [s[g] for s in mem_samples]
+            print(f"[ray-driver]  GPU{g}: util mean={sum(utils)/len(utils):5.1f}%  "
+                  f"min={min(utils):3d}%  max={max(utils):3d}%  "
+                  f"|  mem mean={sum(mems)/len(mems):5.1f}%  max={max(mems):3d}%")
+        # Aggregate across GPUs
+        all_utils = [v for s in util_samples for v in s]
+        print(f"[ray-driver]  ALL: util mean={sum(all_utils)/len(all_utils):5.1f}%  "
+              f"(saturation = {sum(1 for v in all_utils if v >= 90) / len(all_utils) * 100:.0f}% of samples ≥90%)")
+        print(f"[ray-driver] ==================")
 
 
 def main():

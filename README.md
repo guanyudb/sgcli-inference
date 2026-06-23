@@ -82,6 +82,29 @@ Notes:
 - H100 per-GPU is ~1.65x A10 (less than typical 3-4x for transformers — ESM-2 650M with bs=32, seq_len=1024 in FP16 is memory-bandwidth bound, not compute bound)
 - Earlier 1 A10 / 1K seq result was 13.4 seq/s — lower because per-batch overhead wasn't amortized
 
+## Larger run: 200K (A10) and 500K (H100)
+
+| Config | Records | Wall | Aggregate tput | Per-GPU tput | GPU util | vs 1 A10 |
+|--------|---------|------|----------------|--------------|----------|----------|
+| 1× A10 | 200K | 2h 39m | 21.0 seq/s | 21.0 | 93.7% | 1.00x |
+| 2× A10 (sharded) | 200K | 1h 20m | 41.8 seq/s | 20.9 | 93.6% | 1.99x (perfect linear) |
+| **1 H100 node** (8 GPU) | 500K | 10m | **836.7 seq/s** | 104.6 | 73.0% | **~40x** |
+
+A10 is fully compute-saturated at ~94% util. H100 has 27% headroom at default config — investigated in the sweep below.
+
+## H100 optimization sweep (100K, 6 variants)
+
+We tried 5 levers to push H100 utilization. Full details in [SWEEP_RESULTS.md](ray_esm2_embed/SWEEP_RESULTS.md). The big finding: **the actor's CPU tokenization is the throughput limiter, not GPU compute.**
+
+| Variant | Throughput | Util | vs baseline |
+|---------|-----------|------|-------------|
+| Baseline (B=32) | 655 seq/s | 58% | 1.00x |
+| Larger batch (B=128) | 611 seq/s | 59% | 0.93x (no help) |
+| + torch.compile | 440 seq/s | 28% | 0.67x (dynamic shapes kill it) |
+| **+ pretokenize** | **797 seq/s** | **76%** | **1.22x** ⭐ |
+
+**Recommendation for production**: pretokenize the input once via [`prep_tokenized.py`](ray_esm2_embed/prep_tokenized.py), set `PRETOKENIZED=1` in the workload. Same pattern carries to Teddy (heavier tokenizer → even bigger lever).
+
 ## Known platform gotchas (the ones we hit)
 
 ### Ray / `serverless_gpu` constraints
